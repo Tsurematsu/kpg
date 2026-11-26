@@ -137,12 +137,33 @@ export interface DbColumnInfo {
   defaultValue: string;
 }
 
+export type NetworkAccessMode = 'close' | 'nodeport' | 'clusterip';
+
 export interface NodePortInfo {
   serviceName: string;
   namespace: string;
   nodePort: number;
   targetPort: number;
   hostIp: string;
+  labelId: string;
+  appPassword: string | null;
+  tlsMode: TlsPolicyMode;
+  urlMasked: string;
+  urlFull: string;
+}
+
+export interface NetworkAccessInfo {
+  mode: 'nodeport' | 'clusterip';
+  serviceName: string;
+  namespace: string;
+  port: number;
+  nodePort?: number;
+  targetPort: number;
+  hostIp: string;
+  clusterIp?: string;
+  shortDns: string;
+  fqdnDns: string;
+  connectHost: string;
   labelId: string;
   appPassword: string | null;
   tlsMode: TlsPolicyMode;
@@ -675,6 +696,24 @@ interface RawClusterSpec {
   };
 }
 
+export async function getClusterRawPgHba(
+  db: ClusterDBInfo,
+): Promise<string[] | null> {
+  try {
+    const raw = await runKubectlJson<RawClusterSpec>([
+      'get',
+      'cluster.postgresql.cnpg.io',
+      db.name,
+      '-n',
+      db.namespace,
+    ]);
+    const rules = raw.spec?.postgresql?.pg_hba;
+    return Array.isArray(rules) && rules.length > 0 ? rules : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function getTlsPolicy(db: ClusterDBInfo): Promise<TlsPolicyMode> {
   const raw = await runKubectlJson<RawClusterSpec>([
     'get',
@@ -753,6 +792,7 @@ interface RawService {
   };
   spec?: {
     type?: string;
+    clusterIP?: string;
     selector?: Record<string, string>;
     ports?: Array<{
       port?: number;
@@ -929,6 +969,80 @@ export async function removeKpgUserPassword(
   });
 }
 
+export async function syncAppSecretPassword(
+  db: ClusterDBInfo,
+  password: string,
+): Promise<void> {
+  const b64 = Buffer.from(password, 'utf8').toString('base64');
+  const res = await runKubectl(
+    [
+      'patch',
+      'secret',
+      `${db.name}-app`,
+      '-n',
+      db.namespace,
+      '--type=merge',
+      '-p',
+      JSON.stringify({ data: { password: b64 } }),
+    ],
+    { timeoutMs: 10000 },
+  );
+  if (res.code !== 0) {
+    throw new Error(
+      res.stderr.trim() ||
+        res.stdout.trim() ||
+        `No se pudo sincronizar el Secret ${db.name}-app en ${db.namespace}.`,
+    );
+  }
+}
+
+export async function copyKpgCredentialsSecret(
+  sourceDb: ClusterDBInfo,
+  targetDb: ClusterDBInfo,
+): Promise<number> {
+  const existing = await getKpgCredentialsSecret(sourceDb);
+  const entries = Object.entries(existing);
+  if (entries.length === 0) return 0;
+
+  const secretName = getKpgCredentialsSecretName(targetDb.name);
+  const encodedData: Record<string, string> = {};
+  for (const [k, v] of entries) {
+    encodedData[k] = Buffer.from(v, 'utf8').toString('base64');
+  }
+
+  const secretManifest = {
+    apiVersion: 'v1',
+    kind: 'Secret',
+    type: 'Opaque',
+    metadata: {
+      name: secretName,
+      namespace: targetDb.namespace,
+      labels: {
+        'kpg.io/managed': 'true',
+        'kpg.io/cluster': targetDb.name,
+        'kpg.io/type': 'credentials',
+      },
+    },
+    data: encodedData,
+  };
+
+  const secretYaml = yaml.dump(secretManifest, { lineWidth: -1, noRefs: true });
+  const res = await runKubectl(['apply', '-f', '-'], {
+    stdin: secretYaml,
+    timeoutMs: 15000,
+  });
+
+  if (res.code !== 0) {
+    throw new Error(
+      res.stderr.trim() ||
+        res.stdout.trim() ||
+        `No se pudo copiar el Secret ${secretName} hacia ${targetDb.namespace}.`,
+    );
+  }
+
+  return entries.length;
+}
+
 export async function getAllStoredUserPasswords(
   db: ClusterDBInfo,
 ): Promise<Record<string, { password: string; source: 'cnpg' | 'kpg' }>> {
@@ -1056,66 +1170,9 @@ function buildConnectionUrls(
   return buildConnectionUrlsForUser(hostIp, nodePort, 'app', password, tlsMode);
 }
 
-export async function getNodePortAccess(
+async function getPrimarySelectorForCluster(
   db: ClusterDBInfo,
-  hostIp: string,
-): Promise<NodePortInfo | null> {
-  const [svcList, tlsMode, appPassword] = await Promise.all([
-    runKubectlJson<RawServiceList>([
-      'get',
-      'svc',
-      '-n',
-      db.namespace,
-      '-l',
-      `kpg.io/cluster=${db.name}`,
-    ]).catch(() => ({ items: [] })),
-    getTlsPolicy(db).catch(() => 'optional' as TlsPolicyMode),
-    getAppSecretPassword(db),
-  ]);
-
-  const npSvc = svcList.items.find((s) => s.spec?.type === 'NodePort');
-  if (!npSvc) return null;
-
-  const portEntry = npSvc.spec?.ports?.[0];
-  const nodePort = portEntry?.nodePort;
-  if (!nodePort) return null;
-
-  const labelId =
-    npSvc.metadata.labels?.['kpg.io/label-id'] ??
-    db.labelId?.display ??
-    getStableLabelToken(db);
-
-  const { urlMasked, urlFull } = buildConnectionUrls(
-    hostIp,
-    nodePort,
-    appPassword,
-    tlsMode,
-  );
-
-  return {
-    serviceName: npSvc.metadata.name,
-    namespace: npSvc.metadata.namespace,
-    nodePort,
-    targetPort: Number(portEntry.targetPort ?? 5432) || 5432,
-    hostIp,
-    labelId,
-    appPassword,
-    tlsMode,
-    urlMasked,
-    urlFull,
-  };
-}
-
-export async function createOrGetNodePortAccess(
-  db: ClusterDBInfo,
-  hostIp: string,
-): Promise<{ info: NodePortInfo; created: boolean }> {
-  const existing = await getNodePortAccess(db, hostIp);
-  if (existing) {
-    return { info: existing, created: false };
-  }
-
-  // Copy exact primary selector from CNPG's <cluster>-rw service so NodePort survives switchovers/migrations!
+): Promise<Record<string, string>> {
   let selector: Record<string, string> = {
     'cnpg.io/cluster': db.name,
     'cnpg.io/instanceRole': 'primary',
@@ -1134,11 +1191,256 @@ export async function createOrGetNodePortAccess(
   } catch {
     // keep default CNPG selector
   }
+  return selector;
+}
+
+async function applyServiceManifestPreservingForeignMetadata(
+  svcYaml: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const ssaRes = await runKubectl(
+    ['apply', '--server-side', '--field-manager=kpg', '-f', '-'],
+    {
+      stdin: svcYaml,
+      timeoutMs: 20000,
+    },
+  );
+  if (ssaRes.code === 0) return ssaRes;
+
+  return runKubectl(['apply', '-f', '-'], {
+    stdin: svcYaml,
+    timeoutMs: 20000,
+  });
+}
+
+export async function getNetworkAccess(
+  db: ClusterDBInfo,
+  hostIp: string,
+): Promise<NetworkAccessInfo | null> {
+  const [svcList, tlsMode, appPassword] = await Promise.all([
+    runKubectlJson<RawServiceList>([
+      'get',
+      'svc',
+      '-n',
+      db.namespace,
+      '-l',
+      `kpg.io/cluster=${db.name}`,
+    ]).catch(() => ({ items: [] })),
+    getTlsPolicy(db).catch(() => 'optional' as TlsPolicyMode),
+    getAppSecretPassword(db),
+  ]);
+
+  const npSvc = svcList.items.find((s) => s.spec?.type === 'NodePort');
+  if (npSvc) {
+    const portEntry = npSvc.spec?.ports?.[0];
+    const nodePort = portEntry?.nodePort;
+    if (!nodePort) return null;
+
+    const labelId =
+      npSvc.metadata.labels?.['kpg.io/label-id'] ??
+      db.labelId?.display ??
+      getStableLabelToken(db);
+
+    const shortDns = npSvc.metadata.name;
+    const fqdnDns = `${npSvc.metadata.name}.${npSvc.metadata.namespace}.svc.cluster.local`;
+    const { urlMasked, urlFull } = buildConnectionUrls(
+      hostIp,
+      nodePort,
+      appPassword,
+      tlsMode,
+    );
+
+    return {
+      mode: 'nodeport',
+      serviceName: npSvc.metadata.name,
+      namespace: npSvc.metadata.namespace,
+      port: nodePort,
+      nodePort,
+      targetPort: Number(portEntry?.targetPort ?? 5432) || 5432,
+      hostIp,
+      clusterIp: npSvc.spec?.clusterIP,
+      shortDns,
+      fqdnDns,
+      connectHost: hostIp,
+      labelId,
+      appPassword,
+      tlsMode,
+      urlMasked,
+      urlFull,
+    };
+  }
+
+  const cipSvc = svcList.items.find(
+    (s) => !s.spec?.type || s.spec.type === 'ClusterIP',
+  );
+  if (!cipSvc) return null;
+
+  const portEntry = cipSvc.spec?.ports?.[0];
+  const port = Number(portEntry?.port ?? 5432) || 5432;
+  const labelId =
+    cipSvc.metadata.labels?.['kpg.io/label-id'] ??
+    db.labelId?.display ??
+    getStableLabelToken(db);
+  const shortDns = cipSvc.metadata.name;
+  const fqdnDns = `${cipSvc.metadata.name}.${cipSvc.metadata.namespace}.svc.cluster.local`;
+  const { urlMasked, urlFull } = buildConnectionUrls(
+    shortDns,
+    port,
+    appPassword,
+    tlsMode,
+  );
+
+  return {
+    mode: 'clusterip',
+    serviceName: cipSvc.metadata.name,
+    namespace: cipSvc.metadata.namespace,
+    port,
+    targetPort: Number(portEntry?.targetPort ?? 5432) || 5432,
+    hostIp,
+    clusterIp: cipSvc.spec?.clusterIP,
+    shortDns,
+    fqdnDns,
+    connectHost: shortDns,
+    labelId,
+    appPassword,
+    tlsMode,
+    urlMasked,
+    urlFull,
+  };
+}
+
+export async function getNodePortAccess(
+  db: ClusterDBInfo,
+  hostIp: string,
+): Promise<NodePortInfo | null> {
+  const access = await getNetworkAccess(db, hostIp);
+  if (!access || access.mode !== 'nodeport' || !access.nodePort) return null;
+  return {
+    serviceName: access.serviceName,
+    namespace: access.namespace,
+    nodePort: access.nodePort,
+    targetPort: access.targetPort,
+    hostIp: access.hostIp,
+    labelId: access.labelId,
+    appPassword: access.appPassword,
+    tlsMode: access.tlsMode,
+    urlMasked: access.urlMasked,
+    urlFull: access.urlFull,
+  };
+}
+
+export async function setNetworkAccessMode(
+  db: ClusterDBInfo,
+  hostIp: string,
+  targetMode: NetworkAccessMode,
+  preferredNodePort?: number,
+): Promise<NetworkAccessInfo | null> {
+  const svcList = await runKubectlJson<RawServiceList>([
+    'get',
+    'svc',
+    '-n',
+    db.namespace,
+    '-l',
+    `kpg.io/cluster=${db.name}`,
+  ]).catch(() => ({ items: [] }));
+
+  const existingItems = svcList.items ?? [];
+
+  if (targetMode === 'close') {
+    for (const svc of existingItems) {
+      await deleteNodePortAccess(db, svc.metadata.name);
+    }
+    return null;
+  }
 
   const labelToken = getStableLabelToken(db);
-  const serviceName = sanitizeK8sLabelToken(`kpg-np-${labelToken}`);
+  const selector = await getPrimarySelectorForCluster(db);
 
-  const svcManifest = {
+  if (targetMode === 'nodeport') {
+    // Remove any ClusterIP services managed by kpg for this DB
+    for (const svc of existingItems) {
+      if (svc.spec?.type !== 'NodePort') {
+        await deleteNodePortAccess(db, svc.metadata.name);
+      }
+    }
+
+    const existingNp = existingItems.find((s) => s.spec?.type === 'NodePort');
+    if (existingNp) {
+      return getNetworkAccess(db, hostIp);
+    }
+
+    const serviceName = sanitizeK8sLabelToken(`kpg-np-${labelToken}`);
+    const buildManifest = (np?: number) => ({
+      apiVersion: 'v1',
+      kind: 'Service',
+      metadata: {
+        name: serviceName,
+        namespace: db.namespace,
+        labels: {
+          'kpg.io/managed': 'true',
+          'kpg.io/cluster': db.name,
+          'kpg.io/label-id': labelToken,
+          'kpg.io/access-mode': 'nodeport',
+        },
+      },
+      spec: {
+        type: 'NodePort',
+        selector,
+        ports: [
+          {
+            name: 'postgres',
+            protocol: 'TCP',
+            port: 5432,
+            targetPort: 5432,
+            ...(np ? { nodePort: np } : {}),
+          },
+        ],
+      },
+    });
+
+    let applyRes = await applyServiceManifestPreservingForeignMetadata(
+      yaml.dump(buildManifest(preferredNodePort), { lineWidth: -1, noRefs: true }),
+    );
+
+    if (applyRes.code !== 0 && preferredNodePort) {
+      // Fallback to Kubernetes auto-assigned port if preferred port is taken
+      applyRes = await applyServiceManifestPreservingForeignMetadata(
+        yaml.dump(buildManifest(undefined), { lineWidth: -1, noRefs: true }),
+      );
+    }
+
+    if (applyRes.code !== 0) {
+      throw new Error(
+        applyRes.stderr.trim() ||
+          applyRes.stdout.trim() ||
+          'No se pudo crear el Service NodePort.',
+      );
+    }
+
+    const created = await getNetworkAccess(db, hostIp);
+    if (!created || created.mode !== 'nodeport') {
+      throw new Error(
+        'El Service NodePort se aplicó, pero aún no reporta puerto asignado.',
+      );
+    }
+    return created;
+  }
+
+  // targetMode === 'clusterip'
+  for (const svc of existingItems) {
+    if (svc.spec?.type === 'NodePort') {
+      await deleteNodePortAccess(db, svc.metadata.name);
+    }
+  }
+
+  const existingCip = existingItems.find(
+    (s) => !s.spec?.type || s.spec.type === 'ClusterIP',
+  );
+  if (existingCip) {
+    return getNetworkAccess(db, hostIp);
+  }
+
+  const serviceName = sanitizeK8sLabelToken(`kpg-svc-${labelToken}`);
+  const cipManifest = {
     apiVersion: 'v1',
     kind: 'Service',
     metadata: {
@@ -1148,10 +1450,11 @@ export async function createOrGetNodePortAccess(
         'kpg.io/managed': 'true',
         'kpg.io/cluster': db.name,
         'kpg.io/label-id': labelToken,
+        'kpg.io/access-mode': 'clusterip',
       },
     },
     spec: {
-      type: 'NodePort',
+      type: 'ClusterIP',
       selector,
       ports: [
         {
@@ -1164,28 +1467,63 @@ export async function createOrGetNodePortAccess(
     },
   };
 
-  const svcYaml = yaml.dump(svcManifest, { lineWidth: -1, noRefs: true });
-  const applyRes = await runKubectl(['apply', '-f', '-'], {
-    stdin: svcYaml,
-    timeoutMs: 20000,
-  });
-
+  const applyRes = await applyServiceManifestPreservingForeignMetadata(
+    yaml.dump(cipManifest, { lineWidth: -1, noRefs: true }),
+  );
   if (applyRes.code !== 0) {
     throw new Error(
       applyRes.stderr.trim() ||
         applyRes.stdout.trim() ||
-        'No se pudo crear el Service NodePort.',
+        'No se pudo crear el Service ClusterIP privado.',
     );
   }
 
-  const createdInfo = await getNodePortAccess(db, hostIp);
-  if (!createdInfo) {
+  const created = await getNetworkAccess(db, hostIp);
+  if (!created || created.mode !== 'clusterip') {
+    throw new Error(
+      'El Service ClusterIP se aplicó, pero no se pudo leer su configuración.',
+    );
+  }
+  return created;
+}
+
+export async function createOrGetNodePortAccess(
+  db: ClusterDBInfo,
+  hostIp: string,
+  preferredNodePort?: number,
+): Promise<{ info: NodePortInfo; created: boolean }> {
+  const existing = await getNodePortAccess(db, hostIp);
+  if (existing) {
+    return { info: existing, created: false };
+  }
+
+  const createdNet = await setNetworkAccessMode(
+    db,
+    hostIp,
+    'nodeport',
+    preferredNodePort,
+  );
+  if (!createdNet || createdNet.mode !== 'nodeport' || !createdNet.nodePort) {
     throw new Error(
       'El Service NodePort se aplicó, pero aún no reporta puerto asignado.',
     );
   }
 
-  return { info: createdInfo, created: true };
+  return {
+    info: {
+      serviceName: createdNet.serviceName,
+      namespace: createdNet.namespace,
+      nodePort: createdNet.nodePort,
+      targetPort: createdNet.targetPort,
+      hostIp: createdNet.hostIp,
+      labelId: createdNet.labelId,
+      appPassword: createdNet.appPassword,
+      tlsMode: createdNet.tlsMode,
+      urlMasked: createdNet.urlMasked,
+      urlFull: createdNet.urlFull,
+    },
+    created: true,
+  };
 }
 
 export async function deleteNodePortAccess(

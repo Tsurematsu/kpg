@@ -3,21 +3,33 @@ import { Box, Text, useInput } from 'ink';
 import { TextInputField } from './TextInputField.js';
 import { Spinner } from './Spinner.js';
 import {
+  KPG_NS_USAGE_LABEL,
   createClusterDB,
   generateUniqueLabelId,
   getAgentNodes,
   getDefaultStorageClass,
+  getSelectableNamespaces,
   listClusterDBs,
 } from '../services/cnpg.js';
-import type { ClusterDBInfo, NodeInfo } from '../types/k8s.js';
+import type { ClusterDBInfo, NamespaceInfo, NodeInfo } from '../types/k8s.js';
 
 interface CreateDbModalProps {
   nodes: NodeInfo[];
+  namespaces: NamespaceInfo[];
   existingDbs: ClusterDBInfo[];
   onDone: (refresh: boolean) => void;
 }
 
-type Step = 'name' | 'agent' | 'storage' | 'version' | 'confirm' | 'creating' | 'done' | 'error';
+type Step =
+  | 'namespace'
+  | 'name'
+  | 'agent'
+  | 'storage'
+  | 'version'
+  | 'confirm'
+  | 'creating'
+  | 'done'
+  | 'error';
 
 const POSTGRES_VERSIONS = [
   { label: 'PostgreSQL 16.8 (probado)', image: 'ghcr.io/cloudnative-pg/postgresql:16.8' },
@@ -30,6 +42,7 @@ const STORAGE_REGEX = /^\d+(Mi|Gi|Ti)$/;
 
 export function CreateDbModal({
   nodes,
+  namespaces,
   existingDbs,
   onDone,
 }: CreateDbModalProps) {
@@ -39,9 +52,23 @@ export function CreateDbModal({
     [nodes],
   );
 
+  const selectableNamespaces = useMemo(
+    () => getSelectableNamespaces(namespaces),
+    [namespaces],
+  );
+
+  const dbCountByNs = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const d of existingDbs) {
+      map.set(d.namespace, (map.get(d.namespace) ?? 0) + 1);
+    }
+    return map;
+  }, [existingDbs]);
+
   const labelId = useMemo(() => generateUniqueLabelId(nodes), [nodes]);
 
-  const [step, setStep] = useState<Step>('name');
+  const [step, setStep] = useState<Step>('namespace');
+  const [nsIdx, setNsIdx] = useState(0);
   const [name, setName] = useState('');
   const [nameError, setNameError] = useState<string | null>(null);
   const [agentIdx, setAgentIdx] = useState(0);
@@ -61,11 +88,15 @@ export function CreateDbModal({
     };
   }, []);
 
-  // Poll cluster status briefly after applying while on 'creating' -> 'done'
+  const selectedNamespace = selectableNamespaces[nsIdx] ?? null;
   const selectedAgent = agents[agentIdx] ?? null;
   const selectedVersion = POSTGRES_VERSIONS[versionIdx] ?? POSTGRES_VERSIONS[0];
 
   const validateAndNextFromName = () => {
+    if (!selectedNamespace) {
+      setStep('namespace');
+      return;
+    }
     const trimmed = name.trim().toLowerCase();
     if (!trimmed) {
       setNameError('Ingresa un nombre para la base de datos.');
@@ -75,8 +106,14 @@ export function CreateDbModal({
       setNameError('Solo minúsculas, números y guiones (ej: ventas-db).');
       return;
     }
-    if (existingDbs.some((d) => d.name === trimmed && d.namespace === 'default')) {
-      setNameError(`Ya existe una BD llamada "${trimmed}" en el namespace default.`);
+    if (
+      existingDbs.some(
+        (d) => d.name === trimmed && d.namespace === selectedNamespace.name,
+      )
+    ) {
+      setNameError(
+        `Ya existe una BD llamada "${trimmed}" en el namespace "${selectedNamespace.name}".`,
+      );
       return;
     }
     setName(trimmed);
@@ -101,7 +138,7 @@ export function CreateDbModal({
   };
 
   const runCreate = async () => {
-    if (!selectedAgent) return;
+    if (!selectedAgent || !selectedNamespace) return;
     setStep('creating');
     setLogs([]);
     setErrorMsg('');
@@ -110,7 +147,7 @@ export function CreateDbModal({
       await createClusterDB(
         {
           name,
-          namespace: 'default',
+          namespace: selectedNamespace.name,
           agentNode: selectedAgent.name,
           storageSize,
           storageClass,
@@ -133,14 +170,14 @@ export function CreateDbModal({
           const dbs = await listClusterDBs();
           if (cancelledRef.current) return;
           const created = dbs.find(
-            (d) => d.name === name && d.namespace === 'default',
+            (d) => d.name === name && d.namespace === selectedNamespace.name,
           );
           if (created) {
             setClusterPhase(created.phase);
             if (created.healthy && created.readyInstances >= 1) {
               setLogs((prev) => [
                 ...prev.slice(-8),
-                `✔ ${created.currentPrimary} Running en ${created.primaryNode} (Cluster in healthy state)`,
+                `✔ ${created.currentPrimary} Running en ${created.primaryNode} (ns: ${created.namespace})`,
               ]);
               setStep('done');
               return;
@@ -172,6 +209,27 @@ export function CreateDbModal({
       if (step === 'done' || step === 'error') {
         if (key.escape || key.return || lower === 'q') {
           onDone(step === 'done');
+        }
+        return;
+      }
+
+      if (step === 'namespace') {
+        if (key.escape || lower === 'q') {
+          onDone(false);
+          return;
+        }
+        if (selectableNamespaces.length === 0) return;
+        if (key.upArrow || lower === 'k') {
+          setNsIdx((prev) =>
+            prev > 0 ? prev - 1 : selectableNamespaces.length - 1,
+          );
+        } else if (key.downArrow || lower === 'j') {
+          setNsIdx((prev) =>
+            prev < selectableNamespaces.length - 1 ? prev + 1 : 0,
+          );
+        } else if (key.return && selectedNamespace) {
+          setNameError(null);
+          setStep('name');
         }
         return;
       }
@@ -258,10 +316,79 @@ export function CreateDbModal({
         </Text>
       </Box>
 
+      {step === 'namespace' && (
+        <Box flexDirection="column" gap={1}>
+          <Text>
+            1/5 · Selecciona el <Text bold>namespace</Text> existente donde vivirá la BD (excluye{' '}
+            <Text dimColor>default</Text> y sistema):
+          </Text>
+          {selectableNamespaces.length === 0 ? (
+            <Box
+              flexDirection="column"
+              borderStyle="round"
+              borderColor="yellow"
+              paddingX={1}
+              gap={0}
+            >
+              <Text color="yellow" bold>
+                No hay namespaces personalizados disponibles en el cluster.
+              </Text>
+              <Text dimColor>
+                kpg ignora &quot;default&quot; para nuevos despliegues y no crea namespaces. Crea uno primero con tu herramienta de namespaces o ejecuta: kubectl create namespace &lt;nombre&gt;
+              </Text>
+            </Box>
+          ) : (
+            <Box flexDirection="column">
+              {selectableNamespaces.map((ns, idx) => {
+                const selected = idx === nsIdx;
+                const count = dbCountByNs.get(ns.name) ?? 0;
+                const otherKeys = Object.keys(ns.otherToolLabels);
+                return (
+                  <Box key={ns.name} justifyContent="space-between">
+                    <Box gap={1}>
+                      <Text color={selected ? 'cyan' : 'gray'} bold={selected}>
+                        {selected ? '❯' : ' '}
+                      </Text>
+                      <Text color={ns.usedByKpg ? 'green' : 'gray'}>
+                        {ns.usedByKpg ? '★' : '●'}
+                      </Text>
+                      <Text color={selected ? 'cyan' : 'white'} bold={selected}>
+                        {ns.name}
+                      </Text>
+                      <Text dimColor>
+                        ({count} BD{count === 1 ? '' : 's'})
+                      </Text>
+                    </Box>
+                    <Text dimColor>
+                      {ns.usedByKpg ? 'kpg' : ''}
+                      {ns.usedByKpg && otherKeys.length > 0 ? ' · ' : ''}
+                      {otherKeys.length > 0
+                        ? `otras: ${otherKeys.join(', ')}`
+                        : !ns.usedByKpg
+                          ? 'libre'
+                          : ''}
+                    </Text>
+                  </Box>
+                );
+              })}
+            </Box>
+          )}
+          <Text dimColor>
+            {selectableNamespaces.length > 0
+              ? '[↑/↓] Elegir · [Enter] Siguiente · [Esc/Q] Cancelar'
+              : '[Esc/Q] Volver al menú principal'}
+          </Text>
+        </Box>
+      )}
+
       {step === 'name' && (
         <Box flexDirection="column" gap={1}>
           <Text>
-            1/4 · Nombre de la base de datos (ej. <Text dimColor>ventas-db</Text>):
+            2/5 · Nombre de la base de datos en{' '}
+            <Text color="cyan" bold>
+              {selectedNamespace?.name}
+            </Text>{' '}
+            (ej. <Text dimColor>ventas-db</Text>):
           </Text>
           <TextInputField
             value={name}
@@ -270,19 +397,19 @@ export function CreateDbModal({
               setNameError(null);
             }}
             onSubmit={validateAndNextFromName}
-            onCancel={() => onDone(false)}
+            onCancel={() => setStep('namespace')}
             placeholder="mi-nueva-db"
             isActive
           />
           {nameError ? <Text color="red">{nameError}</Text> : null}
-          <Text dimColor>[Enter] Siguiente · [Esc] Cancelar</Text>
+          <Text dimColor>[Enter] Siguiente · [Esc] Atrás</Text>
         </Box>
       )}
 
       {step === 'agent' && (
         <Box flexDirection="column" gap={1}>
           <Text>
-            2/4 · Selecciona el <Text bold>agente</Text> donde nacerá{' '}
+            3/5 · Selecciona el <Text bold>agente</Text> donde nacerá{' '}
             <Text color="cyan" bold>
               {name}
             </Text>
@@ -316,7 +443,7 @@ export function CreateDbModal({
       {step === 'storage' && (
         <Box flexDirection="column" gap={1}>
           <Text>
-            3/4 · Tamaño de volumen persistente (StorageClass:{' '}
+            4/5 · Tamaño de volumen persistente (StorageClass:{' '}
             <Text color="cyan">{storageClass}</Text>):
           </Text>
           <TextInputField
@@ -337,7 +464,7 @@ export function CreateDbModal({
 
       {step === 'version' && (
         <Box flexDirection="column" gap={1}>
-          <Text>4/4 · Selecciona la versión de PostgreSQL:</Text>
+          <Text>5/5 · Selecciona la versión de PostgreSQL:</Text>
           <Box flexDirection="column">
             {POSTGRES_VERSIONS.map((v, idx) => {
               const selected = idx === versionIdx;
@@ -370,7 +497,14 @@ export function CreateDbModal({
           >
             <Text>
               <Text dimColor>Nombre: </Text>
-              <Text bold>{name}</Text> <Text dimColor>(namespace: default)</Text>
+              <Text bold>{name}</Text>
+            </Text>
+            <Text>
+              <Text dimColor>Namespace: </Text>
+              <Text color="cyan" bold>
+                {selectedNamespace?.name}
+              </Text>{' '}
+              <Text dimColor>(se marcará {KPG_NS_USAGE_LABEL}=true)</Text>
             </Text>
             <Text>
               <Text dimColor>Agente destino: </Text>

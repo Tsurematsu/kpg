@@ -3,6 +3,7 @@ import { Box, Text, useInput } from 'ink';
 import { Header } from './Header.js';
 import { FooterBar } from './FooterBar.js';
 import { LabelsModal } from './LabelsModal.js';
+import { NamespacesModal } from './NamespacesModal.js';
 import { CreateDbModal } from './CreateDbModal.js';
 import { ReplicasModal } from './ReplicasModal.js';
 import { DeleteDbModal } from './DeleteDbModal.js';
@@ -33,6 +34,7 @@ interface DashboardScreenProps {
 type ActiveModal =
   | null
   | { type: 'labels' }
+  | { type: 'namespaces' }
   | { type: 'create' }
   | { type: 'replicas'; db: ClusterDBInfo }
   | { type: 'power'; db: ClusterDBInfo }
@@ -115,6 +117,7 @@ export function DashboardScreen({
 
   const dbs = snapshot?.dbs ?? [];
   const nodes = snapshot?.nodes ?? [];
+  const namespaces = snapshot?.namespaces ?? [];
   const agents = getAgentNodes(nodes);
   const operator = snapshot?.operator ?? initialOperator;
   const selectedDb = dbs[selectedIndex] ?? null;
@@ -151,6 +154,11 @@ export function DashboardScreen({
 
       if (lower === 'l') {
         setActiveModal({ type: 'labels' });
+        return;
+      }
+
+      if (lower === 's') {
+        setActiveModal({ type: 'namespaces' });
         return;
       }
 
@@ -191,15 +199,6 @@ export function DashboardScreen({
             title: 'Traslado bloqueado — La BD no está en estado sano',
             message: `Estado actual de "${selectedDb.name}": ${selectedDb.phase} (${selectedDb.readyInstances}/${selectedDb.instances} listas). Espera a que esté Healthy antes de trasladar.`,
             accent: 'yellow',
-          });
-          return;
-        }
-        if (!selectedDb.labelId) {
-          setActiveModal({
-            type: 'notice',
-            title: 'Traslado bloqueado — Sin nodeSelector / Label ID',
-            message: `La BD "${selectedDb.name}" no tiene un nodeSelector configurado para controlar en qué agente corre.`,
-            accent: 'red',
           });
           return;
         }
@@ -257,6 +256,9 @@ export function DashboardScreen({
       <MoveDbScreen
         db={activeScreen.db}
         nodes={nodes}
+        namespaces={namespaces}
+        allDbs={dbs}
+        serverUrl={kubectl.serverUrl}
         onClose={(shouldRefresh) => {
           setActiveScreen(null);
           if (shouldRefresh) void fetchData(false);
@@ -383,11 +385,12 @@ export function DashboardScreen({
             <Box>
               <Text bold dimColor>
                 {'  '}
-                {padCell('BASE DE DATOS', 20)}
-                {padCell('LABEL ID', 18)}
-                {padCell('ESTADO', 16)}
-                {padCell('PRIMARIO (AGENTE)', 26)}
-                {'RÉPLICAS (AGENTES)'}
+                {padCell('BASE DE DATOS', 18)}
+                {padCell('NAMESPACE', 16)}
+                {padCell('LABEL ID', 16)}
+                {padCell('ESTADO', 14)}
+                {padCell('PRIMARIO (AGENTE)', 24)}
+                {'RÉPLICAS'}
               </Text>
             </Box>
 
@@ -398,10 +401,8 @@ export function DashboardScreen({
             {/* Table Rows */}
             {dbs.map((db, idx) => {
               const isSelected = idx === selectedIndex;
-              const dbDisplay =
-                db.namespace === 'default'
-                  ? db.name
-                  : `${db.namespace}/${db.name}`;
+              const isLegacyDefault = db.namespace === 'default';
+              const nsDisplay = isLegacyDefault ? 'default (⚠)' : db.namespace;
               const labelDisplay = db.labelId?.display ?? '—';
               const statusShort =
                 db.powerState === 'hibernated'
@@ -412,7 +413,7 @@ export function DashboardScreen({
                       ? '◐ Encendiendo'
                       : db.healthy
                         ? '● Healthy'
-                        : `◐ ${db.phase.slice(0, 12)}`;
+                        : `◐ ${db.phase.slice(0, 10)}`;
               const statusColor = isSelected
                 ? 'cyan'
                 : db.powerState === 'hibernated'
@@ -439,22 +440,41 @@ export function DashboardScreen({
                     inverse={isSelected}
                   >
                     {isSelected ? '❯ ' : '  '}
-                    {padCell(dbDisplay, 20)}
-                    {padCell(labelDisplay, 18)}
+                    {padCell(db.name, 18)}
                   </Text>
                   <Text
-                    color={statusColor}
+                    color={
+                      isSelected
+                        ? 'cyan'
+                        : isLegacyDefault
+                          ? 'yellow'
+                          : 'white'
+                    }
                     bold={isSelected}
                     inverse={isSelected}
                   >
-                    {padCell(statusShort, 16)}
+                    {padCell(nsDisplay, 16)}
                   </Text>
                   <Text
                     color={isSelected ? 'cyan' : undefined}
                     bold={isSelected}
                     inverse={isSelected}
                   >
-                    {padCell(primaryDisplay, 26)}
+                    {padCell(labelDisplay, 16)}
+                  </Text>
+                  <Text
+                    color={statusColor}
+                    bold={isSelected}
+                    inverse={isSelected}
+                  >
+                    {padCell(statusShort, 14)}
+                  </Text>
+                  <Text
+                    color={isSelected ? 'cyan' : undefined}
+                    bold={isSelected}
+                    inverse={isSelected}
+                  >
+                    {padCell(primaryDisplay, 24)}
                     {replicasDisplay}
                   </Text>
                 </Box>
@@ -503,6 +523,7 @@ export function DashboardScreen({
           { key: 'a', label: 'Acceso', disabled: !hasDbs },
           { key: 'v', label: 'Env', disabled: !hasDbs, accent: 'cyan' },
           { key: 'b', label: 'Backup', disabled: !hasDbs },
+          { key: 's', label: 'Namespaces', accent: 'cyan' },
           { key: 'l', label: 'Labels', accent: 'magenta' },
           { key: 'x', label: 'Eliminar', disabled: !hasDbs, accent: 'red' },
           { key: 'u', label: 'Refrescar' },
@@ -526,9 +547,20 @@ export function DashboardScreen({
               onClose={() => setActiveModal(null)}
             />
           )}
+          {activeModal.type === 'namespaces' && (
+            <NamespacesModal
+              namespaces={namespaces}
+              dbs={dbs}
+              onClose={(shouldRefresh) => {
+                setActiveModal(null);
+                if (shouldRefresh) void fetchData(false);
+              }}
+            />
+          )}
           {activeModal.type === 'create' && (
             <CreateDbModal
               nodes={nodes}
+              namespaces={namespaces}
               existingDbs={dbs}
               onDone={(shouldRefresh) => {
                 setActiveModal(null);

@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   buildConnectionUrlsForUser,
+  type NetworkAccessInfo,
   type NodePortInfo,
   type NodePortUserCredential,
   type TlsPolicyMode,
@@ -17,6 +18,8 @@ export interface EnvGenerationOptions {
   users: NodePortUserCredential[];
   connectionMode: EnvConnectionMode;
   nodePortInfo: NodePortInfo | null;
+  networkAccess?: NetworkAccessInfo | null;
+  internalHostStyle?: 'short' | 'fqdn';
   tlsMode: TlsPolicyMode;
   database?: string;
 }
@@ -75,16 +78,33 @@ export function generateEnvContent(
     users,
     connectionMode,
     nodePortInfo,
+    networkAccess = null,
+    internalHostStyle = 'fqdn',
     tlsMode,
     database = 'app',
   } = options;
 
   const useNodePort = connectionMode === 'nodeport' && nodePortInfo !== null;
+  const useKpgClusterIp =
+    !useNodePort && networkAccess !== null && networkAccess.mode === 'clusterip';
+
   const host = useNodePort
     ? nodePortInfo.hostIp
-    : getInternalServiceHost(db);
-  const port = useNodePort ? nodePortInfo.nodePort : 5432;
-  const effectiveTls = useNodePort ? nodePortInfo.tlsMode : tlsMode;
+    : useKpgClusterIp
+      ? internalHostStyle === 'short'
+        ? networkAccess.shortDns
+        : networkAccess.fqdnDns
+      : getInternalServiceHost(db);
+  const port = useNodePort
+    ? nodePortInfo.nodePort
+    : useKpgClusterIp
+      ? networkAccess.port
+      : 5432;
+  const effectiveTls = useNodePort
+    ? nodePortInfo.tlsMode
+    : useKpgClusterIp
+      ? networkAccess.tlsMode
+      : tlsMode;
   const sslMode = getSslModeParam(effectiveTls);
 
   const missingPasswordUsers = users
@@ -95,7 +115,9 @@ export function generateEnvContent(
     const nowIso = new Date().toISOString().replace('T', ' ').slice(0, 19);
     const connDesc = useNodePort
       ? `NodePort (${nodePortInfo.serviceName} -> ${host}:${port})`
-      : `Service interno k8s (${host}:${port})`;
+      : useKpgClusterIp
+        ? `ClusterIP privado (${networkAccess.serviceName} -> ${host}:${port})`
+        : `Service interno k8s (${host}:${port})`;
 
     const lines: string[] = [
       `# Generado por kpg · BD: ${db.name} (ns: ${db.namespace}) · ${nowIso} UTC`,

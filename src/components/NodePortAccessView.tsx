@@ -1,3 +1,4 @@
+import path from 'node:path';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 import { FooterBar } from './FooterBar.js';
@@ -6,17 +7,25 @@ import { TextInputField } from './TextInputField.js';
 import { useTerminalSize } from '../hooks/useTerminalSize.js';
 import {
   buildConnectionUrlsForUser,
-  createOrGetNodePortAccess,
-  deleteNodePortAccess,
   generateRandomPassword,
   getKpgCredentialsSecretName,
-  getNodePortAccess,
+  getNetworkAccess,
+  getTlsPolicy,
   listNodePortUserCredentials,
+  setNetworkAccessMode,
   updateDbUserPassword,
-  type NodePortInfo,
+  type NetworkAccessInfo,
+  type NetworkAccessMode,
   type NodePortUserCredential,
   type TlsPolicyMode,
 } from '../services/access.js';
+import { copyToClipboard } from '../services/clipboard.js';
+import {
+  buildDefaultEnvFilename,
+  generateEnvContent,
+  getLaunchDir,
+  writeEnvFile,
+} from '../services/env.js';
 import type { ClusterDBInfo } from '../types/k8s.js';
 
 interface NodePortAccessViewProps {
@@ -26,6 +35,16 @@ interface NodePortAccessViewProps {
   onExit: () => void;
 }
 
+const ACCESS_MODES: Array<{
+  id: NetworkAccessMode;
+  label: string;
+  color: string;
+}> = [
+  { id: 'close', label: 'close -> sin acceso fijo', color: 'gray' },
+  { id: 'nodeport', label: 'nodeport -> local', color: 'green' },
+  { id: 'clusterip', label: 'service-ip -> privado', color: 'cyan' },
+];
+
 function padCell(value: string, width: number): string {
   if (value.length >= width) {
     return width > 1 ? `${value.slice(0, width - 1)}…` : value.slice(0, width);
@@ -34,15 +53,9 @@ function padCell(value: string, width: number): string {
 }
 
 function tlsLabel(mode: TlsPolicyMode): string {
-  if (mode === 'disabled') return 'Sin TLS (clientes)';
-  if (mode === 'required') return 'Solo TLS (obligatorio)';
-  return 'Opcional (default)';
-}
-
-function sourceLabel(source: NodePortUserCredential['source']): string {
-  if (source === 'cnpg') return 'CNPG Secret';
-  if (source === 'kpg') return 'kpg Secret';
-  return 'sin guardar';
+  if (mode === 'disabled') return 'Sin TLS';
+  if (mode === 'required') return 'Solo TLS';
+  return 'Opcional';
 }
 
 export function NodePortAccessView({
@@ -53,13 +66,21 @@ export function NodePortAccessView({
 }: NodePortAccessViewProps) {
   const { rows: termHeight } = useTerminalSize();
 
-  const [nodePortInfo, setNodePortInfo] = useState<NodePortInfo | null>(null);
+  const [networkAccess, setNetworkAccess] = useState<NetworkAccessInfo | null>(
+    null,
+  );
+  const [tlsMode, setTlsMode] = useState<TlsPolicyMode>('optional');
   const [credentials, setCredentials] = useState<NodePortUserCredential[]>([]);
-  const [userIdx, setUserIdx] = useState(0);
+
+  // Unified cursor across both blocks:
+  // 0 = Bloque 1 (Acceso selector)
+  // 1 = Bloque 2 item 0 (Generar archivo .env en cwd)
+  // 2..N+1 = Bloque 2 user URLs (credentials[cursor - 2])
+  const [cursor, setCursor] = useState(0);
+  const [selectedMode, setSelectedMode] = useState<NetworkAccessMode>('close');
+
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [showPasswords, setShowPasswords] = useState(false);
-  const [confirmDestroyNp, setConfirmDestroyNp] = useState(false);
   const [editingPasswordFor, setEditingPasswordFor] = useState<{
     username: string;
     value: string;
@@ -70,17 +91,17 @@ export function NodePortAccessView({
   const loadAll = useCallback(async () => {
     setLoading(true);
     setErrorMsg(null);
-    setConfirmDestroyNp(false);
     try {
-      const [info, creds] = await Promise.all([
-        getNodePortAccess(db, hostIp),
+      const [access, creds, tls] = await Promise.all([
+        getNetworkAccess(db, hostIp),
         listNodePortUserCredentials(db),
+        getTlsPolicy(db).catch(() => 'optional' as TlsPolicyMode),
       ]);
-      setNodePortInfo(info);
+      setNetworkAccess(access);
       setCredentials(creds);
-      setUserIdx((prev) =>
-        creds.length === 0 ? 0 : Math.min(prev, creds.length - 1),
-      );
+      setTlsMode(access?.tlsMode ?? tls);
+      setSelectedMode(access?.mode ?? 'close');
+      setCursor((prev) => Math.min(prev, 1 + creds.length));
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
@@ -92,20 +113,133 @@ export function NodePortAccessView({
     void loadAll();
   }, [loadAll]);
 
-  const selectedCred = credentials[userIdx] ?? null;
+  const activeMode: NetworkAccessMode = networkAccess?.mode ?? 'close';
+  const hasPendingModeChange = selectedMode !== activeMode;
+  const totalItems = 2 + credentials.length;
+  const focusedCred = cursor >= 2 ? (credentials[cursor - 2] ?? null) : null;
 
-  const activeUrls = useMemo(() => {
-    if (!nodePortInfo) return null;
-    const username = selectedCred?.username ?? 'app';
-    const password = selectedCred?.password ?? nodePortInfo.appPassword;
-    return buildConnectionUrlsForUser(
-      nodePortInfo.hostIp,
-      nodePortInfo.nodePort,
-      username,
-      password,
-      nodePortInfo.tlsMode,
-    );
-  }, [nodePortInfo, selectedCred]);
+  const launchDir = useMemo(() => getLaunchDir(), []);
+  const quickEnvPath = useMemo(
+    () => path.resolve(launchDir, buildDefaultEnvFilename(db.name)),
+    [launchDir, db.name],
+  );
+
+  const getUrlForCredential = useCallback(
+    (cred: NodePortUserCredential): { urlMasked: string; urlFull: string } | null => {
+      if (!networkAccess) return null;
+      return buildConnectionUrlsForUser(
+        networkAccess.connectHost,
+        networkAccess.port,
+        cred.username,
+        cred.password,
+        networkAccess.tlsMode,
+      );
+    },
+    [networkAccess],
+  );
+
+  const handleApplyMode = async () => {
+    if (!hasPendingModeChange) return;
+    setBusy(true);
+    setErrorMsg(null);
+    setStatusNote(null);
+    try {
+      const updated = await setNetworkAccessMode(db, hostIp, selectedMode);
+      setNetworkAccess(updated);
+      setSelectedMode(updated?.mode ?? 'close');
+      if (!updated) {
+        setStatusNote('✔ Acceso fijo cerrado (Service de kpg eliminado).');
+      } else if (updated.mode === 'nodeport') {
+        setStatusNote(
+          `✔ Acceso NodePort activo: ${updated.hostIp}:${updated.port} (${updated.serviceName}).`,
+        );
+      } else {
+        setStatusNote(
+          `✔ Acceso privado ClusterIP activo: ${updated.shortDns}:${updated.port} (FQDN: ${updated.fqdnDns}).`,
+        );
+      }
+      const creds = await listNodePortUserCredentials(db);
+      setCredentials(creds);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleQuickGenerateEnv = () => {
+    setErrorMsg(null);
+    setStatusNote(null);
+    if (credentials.length === 0) {
+      setErrorMsg('No hay usuarios con permiso LOGIN para incluir en el archivo .env.');
+      return;
+    }
+
+    const withPass = credentials.filter((c) => Boolean(c.password));
+    const targetUsers = withPass.length > 0 ? withPass : credentials;
+
+    const npInfo =
+      networkAccess && networkAccess.mode === 'nodeport' && networkAccess.nodePort
+        ? {
+            serviceName: networkAccess.serviceName,
+            namespace: networkAccess.namespace,
+            nodePort: networkAccess.nodePort,
+            targetPort: networkAccess.targetPort,
+            hostIp: networkAccess.hostIp,
+            labelId: networkAccess.labelId,
+            appPassword: networkAccess.appPassword,
+            tlsMode: networkAccess.tlsMode,
+            urlMasked: networkAccess.urlMasked,
+            urlFull: networkAccess.urlFull,
+          }
+        : null;
+
+    try {
+      const generated = generateEnvContent({
+        db,
+        users: targetUsers,
+        connectionMode: npInfo ? 'nodeport' : 'internal',
+        nodePortInfo: npInfo,
+        networkAccess,
+        internalHostStyle: 'short',
+        tlsMode: networkAccess?.tlsMode ?? tlsMode,
+      });
+      const res = writeEnvFile(quickEnvPath, generated.contentFull, 'overwrite');
+      setStatusNote(
+        `✔ Archivo .env guardado en ${res.filePath} (${targetUsers.length} usuario${targetUsers.length === 1 ? '' : 's'}, ${res.bytesWritten} B).`,
+      );
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleCopyFocusedUrl = async () => {
+    if (!focusedCred) return;
+    setErrorMsg(null);
+    setStatusNote(null);
+
+    if (!networkAccess) {
+      setErrorMsg(
+        'Sin acceso fijo activo. Cambia el selector de Acceso arriba a [nodeport -> local] o [service-ip -> privado] y pulsa Enter.',
+      );
+      return;
+    }
+
+    const urls = getUrlForCredential(focusedCred);
+    if (!urls) return;
+
+    const copyRes = await copyToClipboard(urls.urlFull);
+    if (copyRes.ok) {
+      setStatusNote(
+        `✔ URL completa de "${focusedCred.username}" copiada al portapapeles (${copyRes.method}).`,
+      );
+    } else {
+      setErrorMsg(
+        copyRes.error ||
+          'No se pudo copiar al portapapeles automáticamente en este entorno.',
+      );
+    }
+  };
 
   const isTypingPassword = editingPasswordFor !== null;
 
@@ -113,33 +247,6 @@ export function NodePortAccessView({
     (input, key) => {
       if (busy) return;
       const lower = input.toLowerCase();
-
-      if (confirmDestroyNp) {
-        if (key.escape || lower === 'n') {
-          setConfirmDestroyNp(false);
-          return;
-        }
-        if (
-          (key.return || lower === 'y' || lower === 's' || lower === 'x') &&
-          nodePortInfo
-        ) {
-          setBusy(true);
-          setErrorMsg(null);
-          void deleteNodePortAccess(db, nodePortInfo.serviceName)
-            .then(() => {
-              setNodePortInfo(null);
-              setConfirmDestroyNp(false);
-              setStatusNote(
-                `✔ Conexión NodePort "${nodePortInfo.serviceName}" destruida.`,
-              );
-            })
-            .catch((err) => {
-              setErrorMsg(err instanceof Error ? err.message : String(err));
-            })
-            .finally(() => setBusy(false));
-        }
-        return;
-      }
 
       if (key.escape) {
         onBack();
@@ -153,71 +260,71 @@ export function NodePortAccessView({
         void loadAll();
         return;
       }
+
       if (key.upArrow || lower === 'k') {
-        setUserIdx((prev) =>
-          credentials.length === 0
-            ? 0
-            : prev > 0
-              ? prev - 1
-              : credentials.length - 1,
-        );
+        setCursor((prev) => (prev > 0 ? prev - 1 : totalItems - 1));
         return;
       }
       if (key.downArrow || lower === 'j') {
-        setUserIdx((prev) =>
-          credentials.length === 0
-            ? 0
-            : prev < credentials.length - 1
-              ? prev + 1
-              : 0,
-        );
+        setCursor((prev) => (prev < totalItems - 1 ? prev + 1 : 0));
         return;
       }
-      if (lower === 'p') {
-        setShowPasswords((prev) => !prev);
-        return;
-      }
-      if (lower === 'c' && selectedCred) {
-        if (db.hibernated) {
-          setErrorMsg(
-            `La BD "${db.name}" está apagada. Enciéndela con (p) para cambiar contraseñas en PostgreSQL.`,
-          );
+
+      // Block 1: scrollable horizontal selector
+      if (cursor === 0) {
+        if (key.leftArrow || lower === 'h') {
+          setSelectedMode((prev) => {
+            const idx = ACCESS_MODES.findIndex((m) => m.id === prev);
+            const nextIdx = idx > 0 ? idx - 1 : ACCESS_MODES.length - 1;
+            return ACCESS_MODES[nextIdx].id;
+          });
           return;
         }
-        if (selectedCred.isSystem) {
-          setErrorMsg(
-            `El rol de sistema "${selectedCred.username}" está protegido y no se puede rotar desde aquí.`,
-          );
+        if (key.rightArrow || lower === 'l') {
+          setSelectedMode((prev) => {
+            const idx = ACCESS_MODES.findIndex((m) => m.id === prev);
+            const nextIdx = idx < ACCESS_MODES.length - 1 ? idx + 1 : 0;
+            return ACCESS_MODES[nextIdx].id;
+          });
           return;
         }
-        setErrorMsg(null);
-        setStatusNote(null);
-        setEditingPasswordFor({ username: selectedCred.username, value: '' });
+        if (key.return) {
+          void handleApplyMode();
+        }
         return;
       }
-      if (lower === 'x' && nodePortInfo) {
-        setConfirmDestroyNp(true);
+
+      // Block 2, item 0: Generate .env in cwd
+      if (cursor === 1) {
+        if (key.return) {
+          handleQuickGenerateEnv();
+        }
         return;
       }
-      if (key.return && !nodePortInfo && !loading) {
-        setBusy(true);
-        setErrorMsg(null);
-        setStatusNote(null);
-        void createOrGetNodePortAccess(db, hostIp)
-          .then(async ({ info, created }) => {
-            setNodePortInfo(info);
-            setStatusNote(
-              created
-                ? `✔ Acceso estable NodePort creado (${info.serviceName} → puerto ${info.nodePort}).`
-                : `✔ Ya existía acceso estable NodePort (${info.serviceName}).`,
+
+      // Block 2, user URL rows
+      if (focusedCred) {
+        if (key.return) {
+          void handleCopyFocusedUrl();
+          return;
+        }
+        if (lower === 'c') {
+          if (db.hibernated) {
+            setErrorMsg(
+              `La BD "${db.name}" está apagada. Enciéndela con (p) para cambiar contraseñas en PostgreSQL.`,
             );
-            const creds = await listNodePortUserCredentials(db);
-            setCredentials(creds);
-          })
-          .catch((err) => {
-            setErrorMsg(err instanceof Error ? err.message : String(err));
-          })
-          .finally(() => setBusy(false));
+            return;
+          }
+          if (focusedCred.isSystem) {
+            setErrorMsg(
+              `El rol de sistema "${focusedCred.username}" está protegido y no se puede rotar desde aquí.`,
+            );
+            return;
+          }
+          setErrorMsg(null);
+          setStatusNote(null);
+          setEditingPasswordFor({ username: focusedCred.username, value: '' });
+        }
       }
     },
     { isActive: !isTypingPassword },
@@ -230,50 +337,59 @@ export function NodePortAccessView({
         { key: 'Esc', label: 'Cancelar' },
       ];
     }
-    if (confirmDestroyNp) {
+    if (cursor === 0) {
       return [
-        { key: 'Enter/x', label: 'Confirmar destrucción NodePort', accent: 'red' },
-        { key: 'Esc', label: 'Cancelar' },
+        { key: '↑/↓', label: 'Navegar' },
+        { key: '←/→', label: 'Cambiar modo', accent: 'yellow' },
+        {
+          key: 'Enter',
+          label: 'Aplicar acceso',
+          accent: 'green',
+          disabled: !hasPendingModeChange,
+        },
+        { key: 'u', label: 'Refrescar' },
+        { key: 'Esc', label: 'Atrás' },
+        { key: 'Q', label: 'Salir', accent: 'red' },
       ];
     }
-    const base = [
-      { key: '↑/↓', label: 'Elegir usuario' },
-      {
-        key: 'p',
-        label: showPasswords ? 'Ocultar contraseñas' : 'Mostrar contraseñas',
-        accent: 'yellow',
-      },
-      {
-        key: 'c',
-        label: 'Cambiar/guardar clave',
-        accent: 'cyan',
-        disabled: !selectedCred || selectedCred.isSystem || db.hibernated,
-      },
-    ];
-    if (nodePortInfo) {
+    if (cursor === 1) {
       return [
-        ...base,
-        { key: 'x', label: 'Destruir NodePort', accent: 'red' },
+        { key: '↑/↓', label: 'Navegar' },
+        { key: 'Enter', label: 'Guardar .env aquí', accent: 'green' },
         { key: 'u', label: 'Refrescar' },
         { key: 'Esc', label: 'Atrás' },
         { key: 'Q', label: 'Salir', accent: 'red' },
       ];
     }
     return [
-      { key: 'Enter', label: 'Crear NodePort', accent: 'green' },
-      ...base,
+      { key: '↑/↓', label: 'Navegar' },
+      {
+        key: 'Enter',
+        label: 'Copiar URL',
+        accent: 'green',
+        disabled: !networkAccess,
+      },
+      {
+        key: 'c',
+        label: 'Clave',
+        accent: 'cyan',
+        disabled: !focusedCred || focusedCred.isSystem || db.hibernated,
+      },
+      { key: 'u', label: 'Refrescar' },
       { key: 'Esc', label: 'Atrás' },
       { key: 'Q', label: 'Salir', accent: 'red' },
     ];
   }, [
     editingPasswordFor,
-    confirmDestroyNp,
-    showPasswords,
-    selectedCred,
+    cursor,
+    hasPendingModeChange,
+    networkAccess,
+    focusedCred,
     db.hibernated,
-    nodePortInfo,
   ]);
 
+  const currentModeMeta =
+    ACCESS_MODES.find((m) => m.id === selectedMode) ?? ACCESS_MODES[0];
   const kpgSecretName = getKpgCredentialsSecretName(db.name);
 
   return (
@@ -298,13 +414,13 @@ export function NodePortAccessView({
             {db.name}
           </Text>
           <Text dimColor>
-            ({db.primaryNode} · {db.labelId?.display ?? 'sin label'})
+            ({db.primaryNode} · TLS: {tlsLabel(networkAccess?.tlsMode ?? tlsMode)})
           </Text>
         </Box>
         <Text dimColor>
-          Sección:{' '}
+          Grupo:{' '}
           <Text color="cyan" bold>
-            NodePort y Contraseñas
+            {db.namespace}
           </Text>
         </Text>
       </Box>
@@ -331,84 +447,98 @@ export function NodePortAccessView({
             <Spinner />
             <Text>
               {busy
-                ? 'Aplicando operación sobre NodePort / credenciales...'
-                : 'Consultando Service NodePort y contraseñas almacenadas...'}
+                ? 'Aplicando configuración de acceso...'
+                : 'Consultando acceso de red y credenciales...'}
             </Text>
           </Box>
         ) : (
           <>
-            {/* NodePort Card */}
-            {nodePortInfo ? (
-              <Box
-                flexDirection="column"
-                borderStyle="double"
-                borderColor="green"
-                paddingX={2}
-                paddingY={0}
-              >
-                <Box justifyContent="space-between">
-                  <Text bold color="green">
-                    ● NodePort activo: {nodePortInfo.serviceName}
+            {/* ── BLOQUE 1: ACCESO (SELECTOR DESPLAZABLE + GRUPO/NAMESPACE) ── */}
+            <Box
+              flexDirection="column"
+              borderStyle={cursor === 0 ? 'double' : 'round'}
+              borderColor={
+                cursor === 0
+                  ? 'cyan'
+                  : networkAccess?.mode === 'nodeport'
+                    ? 'green'
+                    : networkAccess?.mode === 'clusterip'
+                      ? 'cyan'
+                      : 'gray'
+              }
+              paddingX={2}
+              paddingY={0}
+            >
+              <Box justifyContent="space-between">
+                <Box gap={1}>
+                  <Text color={cursor === 0 ? 'cyan' : 'gray'} bold={cursor === 0}>
+                    {cursor === 0 ? '❯' : ' '}
                   </Text>
-                  <Text dimColor>
-                    TLS: <Text color="cyan">{tlsLabel(nodePortInfo.tlsMode)}</Text>
+                  <Text bold color={cursor === 0 ? 'cyan' : 'white'}>
+                    Acceso
                   </Text>
-                </Box>
-                <Text>
-                  <Text dimColor>Host / Puerto: </Text>
-                  <Text bold>
-                    {nodePortInfo.hostIp}:{nodePortInfo.nodePort}
+                  <Text dimColor>|</Text>
+                  <Text color={cursor === 0 ? 'yellow' : 'gray'} bold={cursor === 0}>
+                    ◀
                   </Text>
-                  <Text dimColor> → primario automático · Label ID: </Text>
-                  <Text color="yellow" bold>
-                    {nodePortInfo.labelId}
+                  <Text
+                    color={hasPendingModeChange ? 'yellow' : currentModeMeta.color}
+                    bold
+                  >
+                    [{currentModeMeta.label}]
                   </Text>
-                </Text>
-                <Box flexDirection="column" marginTop={0}>
-                  <Text dimColor>
-                    URL para usuario{' '}
-                    <Text color="white" bold>
-                      {selectedCred?.username ?? 'app'}
+                  <Text color={cursor === 0 ? 'yellow' : 'gray'} bold={cursor === 0}>
+                    ▶
+                  </Text>
+                  <Text dimColor>|</Text>
+                  <Text>
+                    <Text dimColor>Grupo:</Text>
+                    <Text color="cyan" bold>
+                      {db.namespace}
                     </Text>
-                    :
-                  </Text>
-                  <Text bold color="cyan">
-                    {showPasswords ? activeUrls?.urlFull : activeUrls?.urlMasked}
                   </Text>
                 </Box>
-              </Box>
-            ) : (
-              <Box
-                flexDirection="column"
-                borderStyle="round"
-                borderColor="yellow"
-                paddingX={2}
-                paddingY={0}
-              >
-                <Text color="yellow" bold>
-                  Esta BD todavía no tiene un Service NodePort creado.
-                </Text>
-                <Text>
-                  Pulsa <Text color="green" bold>[Enter]</Text> para crear el acceso estable ligado al label{' '}
-                  <Text color="green" bold>
-                    {db.labelId?.display ?? db.name}
-                  </Text>{' '}
-                  (copiando selector de {db.name}-rw).
-                </Text>
-              </Box>
-            )}
 
-            {/* Confirm Destroy NodePort */}
-            {confirmDestroyNp && nodePortInfo ? (
-              <Box borderStyle="round" borderColor="red" paddingX={2}>
-                <Text color="red" bold>
-                  ⚠ ¿Destruir Service NodePort &quot;{nodePortInfo.serviceName}&quot;?{' '}
-                  [Enter/x] Sí · [Esc] Cancelar
-                </Text>
+                {hasPendingModeChange ? (
+                  <Text color="yellow" bold>
+                    [Enter] Aplicar
+                  </Text>
+                ) : networkAccess ? (
+                  <Text color={networkAccess.mode === 'nodeport' ? 'green' : 'cyan'}>
+                    ● Activo
+                  </Text>
+                ) : (
+                  <Text dimColor>○ Cerrado</Text>
+                )}
               </Box>
-            ) : null}
 
-            {/* Inline Password Rotation Box */}
+              {/* Active endpoint info line */}
+              <Box marginLeft={2}>
+                {networkAccess?.mode === 'nodeport' ? (
+                  <Text dimColor>
+                    Endpoint:{' '}
+                    <Text color="green" bold>
+                      {networkAccess.hostIp}:{networkAccess.port}
+                    </Text>{' '}
+                    ({networkAccess.serviceName} → primario automático)
+                  </Text>
+                ) : networkAccess?.mode === 'clusterip' ? (
+                  <Text dimColor>
+                    DNS namespace:{' '}
+                    <Text color="cyan" bold>
+                      {networkAccess.shortDns}:{networkAccess.port}
+                    </Text>{' '}
+                    · FQDN: {networkAccess.fqdnDns}
+                  </Text>
+                ) : (
+                  <Text dimColor>
+                    Usa ◀/▶ para elegir [nodeport -&gt; local] o [service-ip -&gt; privado] y pulsa Enter.
+                  </Text>
+                )}
+              </Box>
+            </Box>
+
+            {/* Inline Password Rotation Box (when pressing 'c' on a user) */}
             {editingPasswordFor ? (
               <Box
                 flexDirection="column"
@@ -416,13 +546,12 @@ export function NodePortAccessView({
                 borderColor="cyan"
                 paddingX={2}
                 paddingY={0}
-                gap={0}
               >
                 <Text bold color="cyan">
                   Asignar / rotar contraseña para &quot;{editingPasswordFor.username}&quot;
                 </Text>
                 <Text dimColor>
-                  Déjalo vacío y pulsa Enter para autogenerar una clave segura (se actualiza en PostgreSQL y en Secret {kpgSecretName}):
+                  Vacío + Enter para autogenerar (se actualiza en PostgreSQL y en Secret {kpgSecretName}):
                 </Text>
                 <TextInputField
                   value={editingPasswordFor.value}
@@ -434,15 +563,15 @@ export function NodePortAccessView({
                   onSubmit={() => {
                     const targetUser = editingPasswordFor.username;
                     const finalPass =
-                      editingPasswordFor.value.trim() || generateRandomPassword(20);
+                      editingPasswordFor.value.trim() ||
+                      generateRandomPassword(20);
                     setEditingPasswordFor(null);
                     setBusy(true);
                     setErrorMsg(null);
                     void updateDbUserPassword(db, targetUser, finalPass)
                       .then(async () => {
-                        setShowPasswords(true);
                         setStatusNote(
-                          `✔ Contraseña de "${targetUser}" actualizada en PostgreSQL y guardada en Secret ${kpgSecretName}.`,
+                          `✔ Contraseña de "${targetUser}" actualizada en PostgreSQL y guardada en ${kpgSecretName}.`,
                         );
                         await loadAll();
                       })
@@ -460,69 +589,71 @@ export function NodePortAccessView({
               </Box>
             ) : null}
 
-            {/* Users & Passwords Table */}
-            <Box flexDirection="column" marginTop={0}>
-              <Box justifyContent="space-between">
-                <Text bold>
-                  Usuarios con acceso y contraseñas ({credentials.length})
-                </Text>
-                <Text dimColor>
-                  {showPasswords ? '🔓 Visibles' : '🔒 Ocultas — pulsa (p) para ver'}
+            {/* ── BLOQUE 2: GENERAR .ENV + URLS POR USUARIO ── */}
+            <Box
+              flexDirection="column"
+              borderStyle="single"
+              borderColor={cursor >= 1 ? 'cyan' : 'gray'}
+              paddingX={1}
+              paddingY={0}
+              flexGrow={1}
+            >
+              {/* Item 1: Quick Generate .env */}
+              <Box>
+                <Text
+                  color={cursor === 1 ? 'green' : 'cyan'}
+                  bold={cursor === 1}
+                  inverse={cursor === 1}
+                >
+                  {cursor === 1 ? '❯ ' : '  '}
+                  ⚙ Generar .env → {quickEnvPath}
                 </Text>
               </Box>
 
+              <Text dimColor>{'─'.repeat(78)}</Text>
+
+              {/* User URLs list */}
               {credentials.length === 0 ? (
                 <Text dimColor>No se encontraron usuarios con permiso LOGIN.</Text>
               ) : (
                 <Box flexDirection="column">
-                  <Text bold dimColor>
-                    {'  '}
-                    {padCell('USUARIO', 20)}
-                    {padCell('ORIGEN', 14)}
-                    {padCell('CONTRASEÑA', 28)}
-                    {'PERMISOS'}
-                  </Text>
-                  <Text dimColor>{'─'.repeat(84)}</Text>
                   {credentials.map((cred, idx) => {
-                    const sel = idx === userIdx;
-                    const passDisplay = cred.password
-                      ? showPasswords
-                        ? cred.password
-                        : '••••••••••••••••'
-                      : '(sin guardar — pulsa c)';
+                    const itemIndex = idx + 2;
+                    const isFocused = cursor === itemIndex;
+                    const urls = getUrlForCredential(cred);
+
+                    const urlDisplay = !urls
+                      ? '(sin acceso fijo — activa NodePort o service-ip arriba)'
+                      : isFocused
+                        ? urls.urlFull
+                        : urls.urlMasked;
+
                     return (
                       <Box key={cred.username}>
                         <Text
-                          color={sel ? 'cyan' : undefined}
-                          bold={sel}
-                          inverse={sel}
+                          color={isFocused ? 'cyan' : undefined}
+                          bold={isFocused}
+                          inverse={isFocused}
                         >
-                          {sel ? '❯ ' : '  '}
-                          {padCell(cred.username, 20)}
-                          {padCell(sourceLabel(cred.source), 14)}
+                          {isFocused ? '❯ ' : '  '}
+                          {padCell(cred.username, 16)}
+                          {'│ '}
                         </Text>
                         <Text
                           color={
-                            sel
-                              ? 'cyan'
-                              : cred.password
-                                ? showPasswords
-                                  ? 'yellow'
-                                  : 'green'
+                            isFocused
+                              ? urls
+                                ? 'yellow'
+                                : 'gray'
+                              : urls
+                                ? 'white'
                                 : 'gray'
                           }
-                          bold={sel || (showPasswords && Boolean(cred.password))}
-                          inverse={sel}
+                          dimColor={!isFocused && !urls}
+                          bold={isFocused}
+                          inverse={isFocused}
                         >
-                          {padCell(passDisplay, 28)}
-                        </Text>
-                        <Text
-                          color={sel ? 'cyan' : undefined}
-                          dimColor={!sel}
-                          bold={sel}
-                          inverse={sel}
-                        >
-                          {cred.permissions.join(', ') || 'LOGIN'}
+                          {urlDisplay}
                         </Text>
                       </Box>
                     );
@@ -532,7 +663,11 @@ export function NodePortAccessView({
 
               <Box marginTop={1}>
                 <Text dimColor>
-                  Secrets: &quot;app&quot; viene de {db.name}-app (CNPG); usuarios creados/rotados en kpg se guardan en {kpgSecretName}.
+                  Al enfocar un usuario se muestra su contraseña · Pulsa{' '}
+                  <Text color="green" bold>
+                    Enter
+                  </Text>{' '}
+                  para copiar la URL completa al portapapeles.
                 </Text>
               </Box>
             </Box>
@@ -540,7 +675,7 @@ export function NodePortAccessView({
         )}
       </Box>
 
-      {/* Footer */}
+      {/* Minimal contextual Footer */}
       <FooterBar items={footerItems} />
     </Box>
   );

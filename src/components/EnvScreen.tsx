@@ -8,9 +8,11 @@ import { useTerminalSize } from '../hooks/useTerminalSize.js';
 import {
   createOrGetNodePortAccess,
   extractHostFromServerUrl,
+  getNetworkAccess,
   getNodePortAccess,
   getTlsPolicy,
   listNodePortUserCredentials,
+  type NetworkAccessInfo,
   type NodePortInfo,
   type NodePortUserCredential,
   type TlsPolicyMode,
@@ -100,6 +102,9 @@ export function EnvScreen({
   const [creatingNp, setCreatingNp] = useState(false);
   const [credentials, setCredentials] = useState<NodePortUserCredential[]>([]);
   const [nodePortInfo, setNodePortInfo] = useState<NodePortInfo | null>(null);
+  const [networkAccess, setNetworkAccess] = useState<NetworkAccessInfo | null>(
+    null,
+  );
   const [tlsMode, setTlsMode] = useState<TlsPolicyMode>('optional');
   const [connectionMode, setConnectionMode] =
     useState<EnvConnectionMode>('nodeport');
@@ -136,13 +141,15 @@ export function EnvScreen({
     setLoading(true);
     setErrorMsg(null);
     try {
-      const [creds, np, tls] = await Promise.all([
+      const [creds, np, netAccess, tls] = await Promise.all([
         listNodePortUserCredentials(db),
         getNodePortAccess(db, hostIp),
+        getNetworkAccess(db, hostIp),
         getTlsPolicy(db).catch(() => 'optional' as TlsPolicyMode),
       ]);
       setCredentials(creds);
       setNodePortInfo(np);
+      setNetworkAccess(netAccess);
       setTlsMode(tls);
       setConnectionMode(np ? 'nodeport' : 'internal');
       setSelectedUsernames((prev) => {
@@ -201,9 +208,10 @@ export function EnvScreen({
       users: selectedUsers,
       connectionMode,
       nodePortInfo,
+      networkAccess,
       tlsMode,
     });
-  }, [db, selectedUsers, connectionMode, nodePortInfo, tlsMode]);
+  }, [db, selectedUsers, connectionMode, nodePortInfo, networkAccess, tlsMode]);
 
   const isTyping = stage === 'edit_filename' || stage === 'edit_custom_path';
 
@@ -732,7 +740,9 @@ export function EnvScreen({
                 >
                   {connectionMode === 'nodeport' && nodePortInfo
                     ? `NodePort (${nodePortInfo.hostIp}:${nodePortInfo.nodePort})`
-                    : `Interno k8s (${db.name}-rw:5432)`}
+                    : networkAccess?.mode === 'clusterip'
+                      ? `ClusterIP privado (${networkAccess.shortDns}:${networkAccess.port})`
+                      : `Interno k8s (${db.name}-rw:5432)`}
                 </Text>
               </Text>
             </Box>

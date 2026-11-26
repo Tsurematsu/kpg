@@ -75,8 +75,20 @@ export interface ClusterDBInfo {
   storageClass: string;
 }
 
+export interface NamespaceInfo {
+  name: string;
+  status: string;
+  isSystem: boolean;
+  isDefault: boolean;
+  labels: Record<string, string>;
+  customLabels: Record<string, string>;
+  usedByKpg: boolean;
+  otherToolLabels: Record<string, string>;
+}
+
 export interface ClusterSnapshot {
   nodes: NodeInfo[];
+  namespaces: NamespaceInfo[];
   dbs: ClusterDBInfo[];
   operator: OperatorStatus;
   fetchedAt: Date;

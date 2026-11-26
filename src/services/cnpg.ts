@@ -8,6 +8,7 @@ import type {
   CnpgPluginStatus,
   KubectlConnectionStatus,
   LabelSelectorEntry,
+  NamespaceInfo,
   NodeInfo,
   OperatorStatus,
   ReplicaPodInfo,
@@ -19,6 +20,22 @@ export const CNPG_MANIFEST_URL =
   `https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.29/releases/cnpg-${CNPG_DEFAULT_VERSION}.yaml`;
 
 export const KPG_LABEL_PREFIX = 'kpg.db/';
+export const KPG_NS_USAGE_LABEL = 'tsure.io/kpg';
+
+const SYSTEM_NAMESPACES = new Set([
+  'kube-system',
+  'kube-public',
+  'kube-node-lease',
+  'cnpg-system',
+]);
+
+export function isSystemNamespace(name: string): boolean {
+  return SYSTEM_NAMESPACES.has(name);
+}
+
+export function isDefaultNamespace(name: string): boolean {
+  return name === 'default';
+}
 
 const SYSTEM_LABEL_PREFIXES = [
   'kubernetes.io/',
@@ -641,15 +658,150 @@ export function getAgentNodes(nodes: NodeInfo[]): NodeInfo[] {
   return nodes.filter((n) => !n.isControlPlane);
 }
 
+interface RawNamespaceList {
+  items: Array<{
+    metadata: {
+      name: string;
+      labels?: Record<string, string>;
+    };
+    status?: {
+      phase?: string;
+    };
+  }>;
+}
+
+export async function getNamespaces(): Promise<NamespaceInfo[]> {
+  const raw = await runKubectlJson<RawNamespaceList>(['get', 'namespaces']);
+
+  return (raw.items ?? [])
+    .map((ns) => {
+      const name = ns.metadata.name;
+      const status = ns.status?.phase ?? 'Active';
+      const labels = ns.metadata.labels ?? {};
+      const customLabels: Record<string, string> = {};
+      const otherToolLabels: Record<string, string> = {};
+
+      for (const [k, v] of Object.entries(labels)) {
+        if (!isSystemLabel(k)) {
+          customLabels[k] = v;
+          if (k !== KPG_NS_USAGE_LABEL) {
+            otherToolLabels[k] = v;
+          }
+        }
+      }
+
+      return {
+        name,
+        status,
+        isSystem: isSystemNamespace(name),
+        isDefault: isDefaultNamespace(name),
+        labels,
+        customLabels,
+        usedByKpg: labels[KPG_NS_USAGE_LABEL] === 'true',
+        otherToolLabels,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function getSelectableNamespaces(
+  namespaces: NamespaceInfo[],
+): NamespaceInfo[] {
+  return namespaces
+    .filter((ns) => !ns.isSystem && !ns.isDefault && ns.status === 'Active')
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export async function labelNamespaceInUse(namespace: string): Promise<void> {
+  if (!namespace || isDefaultNamespace(namespace) || isSystemNamespace(namespace)) {
+    return;
+  }
+  const res = await runKubectl(
+    ['label', 'namespace', namespace, `${KPG_NS_USAGE_LABEL}=true`, '--overwrite'],
+    { timeoutMs: 15000 },
+  );
+  if (res.code !== 0) {
+    throw new Error(
+      res.stderr.trim() ||
+        `No se pudo etiquetar el namespace "${namespace}" con ${KPG_NS_USAGE_LABEL}=true.`,
+    );
+  }
+}
+
+export async function unlabelNamespaceInUse(namespace: string): Promise<void> {
+  if (!namespace || isDefaultNamespace(namespace) || isSystemNamespace(namespace)) {
+    return;
+  }
+  const res = await runKubectl(
+    ['label', 'namespace', namespace, `${KPG_NS_USAGE_LABEL}-`],
+    { timeoutMs: 15000 },
+  );
+  if (
+    res.code !== 0 &&
+    !res.stderr.includes('not found') &&
+    !res.stderr.includes('NotFound')
+  ) {
+    throw new Error(
+      res.stderr.trim() ||
+        `No se pudo quitar el label ${KPG_NS_USAGE_LABEL} del namespace "${namespace}".`,
+    );
+  }
+}
+
+export async function syncNamespaceUsageLabel(
+  namespace: string,
+  existingDbs?: ClusterDBInfo[],
+): Promise<boolean> {
+  if (!namespace || isDefaultNamespace(namespace) || isSystemNamespace(namespace)) {
+    return false;
+  }
+  const dbs = existingDbs ?? (await listClusterDBs());
+  const hasDbs = dbs.some((d) => d.namespace === namespace);
+  if (hasDbs) {
+    await labelNamespaceInUse(namespace);
+    return true;
+  }
+  await unlabelNamespaceInUse(namespace);
+  return false;
+}
+
+export async function syncAllNamespaceUsageLabels(): Promise<{
+  labeled: string[];
+  unlabeled: string[];
+}> {
+  const [namespaces, dbs] = await Promise.all([
+    getNamespaces(),
+    listClusterDBs(),
+  ]);
+  const selectable = getSelectableNamespaces(namespaces);
+  const labeled: string[] = [];
+  const unlabeled: string[] = [];
+
+  for (const ns of selectable) {
+    const hasDbs = dbs.some((d) => d.namespace === ns.name);
+    if (hasDbs && !ns.usedByKpg) {
+      await labelNamespaceInUse(ns.name);
+      labeled.push(ns.name);
+    } else if (!hasDbs && ns.usedByKpg) {
+      await unlabelNamespaceInUse(ns.name);
+      unlabeled.push(ns.name);
+    }
+  }
+
+  return { labeled, unlabeled };
+}
+
 export async function getClusterSnapshot(): Promise<ClusterSnapshot> {
-  const [nodes, dbs, operator] = await Promise.all([
+  const [nodes, namespaces, dbs, operator] = await Promise.all([
     getNodes(),
+    getNamespaces().catch(() => [] as NamespaceInfo[]),
     listClusterDBs(),
     checkCnpgOperator(),
   ]);
 
   return {
     nodes,
+    namespaces,
     dbs,
     operator,
     fetchedAt: new Date(),
@@ -744,24 +896,54 @@ export async function getDefaultStorageClass(): Promise<string> {
 
 export interface CreateClusterDBParams {
   name: string;
-  namespace?: string;
+  namespace: string;
   agentNode: string;
   storageSize: string;
   storageClass: string;
   imageName: string;
   labelId: LabelSelectorEntry;
+  pgHba?: string[];
+  skipNodeLabelRollback?: boolean;
 }
 
 export async function createClusterDB(
   params: CreateClusterDBParams,
   onProgress?: (msg: string) => void,
 ): Promise<void> {
-  const namespace = params.namespace || 'default';
+  const namespace = params.namespace;
+
+  if (!isDefaultNamespace(namespace) && !isSystemNamespace(namespace)) {
+    onProgress?.(
+      `Registrando uso de kpg en namespace "${namespace}" (${KPG_NS_USAGE_LABEL}=true)...`,
+    );
+    await labelNamespaceInUse(namespace);
+  }
 
   onProgress?.(
     `Etiquetando agente ${params.agentNode} con ${params.labelId.key}=${params.labelId.value}...`,
   );
   await labelNode(params.agentNode, params.labelId.key, params.labelId.value);
+
+  const specObj: Record<string, unknown> = {
+    instances: 1,
+    imageName: params.imageName,
+    storage: {
+      size: params.storageSize,
+      storageClass: params.storageClass,
+    },
+    affinity: {
+      enablePodAntiAffinity: true,
+      podAntiAffinityType: 'required',
+      topologyKey: 'kubernetes.io/hostname',
+      nodeSelector: {
+        [params.labelId.key]: params.labelId.value,
+      },
+    },
+  };
+
+  if (params.pgHba && params.pgHba.length > 0) {
+    specObj.postgresql = { pg_hba: params.pgHba };
+  }
 
   const manifestObj = {
     apiVersion: 'postgresql.cnpg.io/v1',
@@ -774,22 +956,7 @@ export async function createClusterDB(
         'kpg.io/id': params.labelId.shortId,
       },
     },
-    spec: {
-      instances: 1,
-      imageName: params.imageName,
-      storage: {
-        size: params.storageSize,
-        storageClass: params.storageClass,
-      },
-      affinity: {
-        enablePodAntiAffinity: true,
-        podAntiAffinityType: 'required',
-        topologyKey: 'kubernetes.io/hostname',
-        nodeSelector: {
-          [params.labelId.key]: params.labelId.value,
-        },
-      },
-    },
+    spec: specObj,
   };
 
   const manifestYaml = yaml.dump(manifestObj, { lineWidth: -1, noRefs: true });
@@ -801,9 +968,16 @@ export async function createClusterDB(
   });
 
   if (applyRes.code !== 0) {
-    // Rollback node label if cluster creation failed
+    // Rollback node label (if safe) and namespace usage label if cluster creation failed
+    if (!params.skipNodeLabelRollback) {
+      try {
+        await unlabelNode(params.agentNode, params.labelId.key);
+      } catch {
+        // ignore rollback error
+      }
+    }
     try {
-      await unlabelNode(params.agentNode, params.labelId.key);
+      await syncNamespaceUsageLabel(namespace);
     } catch {
       // ignore rollback error
     }
@@ -1152,6 +1326,21 @@ export async function deleteClusterDB(
         onProgress?.(`Quitando label ${key} del agente ${agent.name}...`);
         await unlabelNode(agent.name, key);
       }
+    }
+  }
+
+  // 5. Reconcile namespace usage label (skip default & system namespaces)
+  if (!isDefaultNamespace(db.namespace) && !isSystemNamespace(db.namespace)) {
+    try {
+      const freshDbs = await listClusterDBs();
+      const stillInUse = await syncNamespaceUsageLabel(db.namespace, freshDbs);
+      onProgress?.(
+        stillInUse
+          ? `Namespace "${db.namespace}" aún tiene otras BDs: se conserva ${KPG_NS_USAGE_LABEL}=true.`
+          : `Label ${KPG_NS_USAGE_LABEL} retirado del namespace "${db.namespace}" (sin BDs activas).`,
+      );
+    } catch {
+      // Best-effort namespace usage label sync
     }
   }
 

@@ -1,22 +1,39 @@
 #!/usr/bin/env sh
-# Instalador automático de kpg (CloudNativePG TUI Manager)
+# Instalador y actualizador automático de kpg (CloudNativePG TUI Manager)
 # Compatible con Ubuntu, Linux Mint, Arch Linux y Fedora (x86_64)
 #
-# Uso:
+# Uso (instala o actualiza a la última versión):
 #   curl -fsSL https://tsurematsu.github.io/kpg/install.sh | sh
 #
 # Variables opcionales:
-#   KPG_INSTALL_DIR=/usr/local/bin   Directorio de instalación (por defecto /usr/local/bin)
-#   KPG_VERSION=latest               Versión/tag a instalar (ej. v1.0.0 o latest)
-#   KPG_SKIP_DEPS=1                  Omite la instalación de kubectl y kubectl-cnpg
+#   KPG_INSTALL_DIR=/usr/local/bin   Directorio de instalación (si ya existe kpg, reutiliza su carpeta)
+#   KPG_VERSION=latest               Versión/tag a instalar (ej. v1.1.0 o latest)
+#   KPG_FORCE=1                      Fuerza la reinstalación aunque ya tengas la misma versión
+#   KPG_SKIP_DEPS=1                  Omite la verificación de kubectl y kubectl-cnpg
 
 set -eu
 
 REPO="Tsurematsu/kpg"
+USER_SET_INSTALL_DIR="${KPG_INSTALL_DIR:-}"
 INSTALL_DIR="${KPG_INSTALL_DIR:-/usr/local/bin}"
 KPG_VERSION="${KPG_VERSION:-latest}"
+FORCE_INSTALL="${KPG_FORCE:-0}"
 SKIP_DEPS="${KPG_SKIP_DEPS:-0}"
 CNPG_FALLBACK_VERSION="1.29.2"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/kpg"
+VERSION_STATE_FILE="$STATE_DIR/version"
+
+# Flags opcionales cuando se ejecuta con argumentos (ej. sh install.sh --force)
+for arg in "$@"; do
+  case "$arg" in
+    --force|-f)
+      FORCE_INSTALL="1"
+      ;;
+    --skip-deps)
+      SKIP_DEPS="1"
+      ;;
+  esac
+done
 
 # Colores (solo si la salida es una terminal)
 if [ -t 1 ]; then
@@ -155,7 +172,7 @@ ensure_base_tools() {
   esac
 }
 
-# Instalar un binario en INSTALL_DIR
+# Instalar un binario en INSTALL_DIR (reemplazo seguro incluso si está en uso)
 install_binary() {
   src="$1"
   name="$2"
@@ -174,6 +191,52 @@ install_binary() {
   else
     run_root install -m 0755 "$src" "$dest"
   fi
+}
+
+# Detectar instalación existente de kpg y su versión (sin bloquearse con binarios v1.0.0)
+EXISTING_KPG=""
+INSTALLED_VERSION=""
+
+detect_existing_kpg() {
+  if [ -z "$USER_SET_INSTALL_DIR" ] && command -v kpg >/dev/null 2>&1; then
+    EXISTING_KPG="$(command -v kpg)"
+    INSTALL_DIR="$(dirname "$EXISTING_KPG")"
+  elif [ -x "$INSTALL_DIR/kpg" ]; then
+    EXISTING_KPG="$INSTALL_DIR/kpg"
+  fi
+
+  if [ -z "$EXISTING_KPG" ]; then
+    return 0
+  fi
+
+  # Usar timeout para no colgarse si hay una v1.0.0 antigua sin soporte --version
+  if command -v timeout >/dev/null 2>&1; then
+    RAW_VER="$(timeout 2 "$EXISTING_KPG" --version </dev/null 2>/dev/null || true)"
+    INSTALLED_VERSION="$(printf '%s\n' "$RAW_VER" | sed -n 's/.*\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*[^[:space:]]*\).*/\1/p' | head -n 1 || true)"
+  fi
+
+  if [ -z "$INSTALLED_VERSION" ] && [ -r "$VERSION_STATE_FILE" ]; then
+    INSTALLED_VERSION="$(head -n 1 "$VERSION_STATE_FILE" | tr -d '[:space:]' || true)"
+  fi
+}
+
+# Resolver tag objetivo de kpg (ej. v1.1.0)
+TARGET_TAG=""
+
+resolve_target_kpg_version() {
+  if [ "$KPG_VERSION" != "latest" ]; then
+    case "$KPG_VERSION" in
+      v*) TARGET_TAG="$KPG_VERSION" ;;
+      *)  TARGET_TAG="v$KPG_VERSION" ;;
+    esac
+    return 0
+  fi
+
+  TARGET_TAG="$(
+    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+      | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      | head -n 1 || true
+  )"
 }
 
 # Descargar kubectl oficial desde dl.k8s.io con verificación SHA-256
@@ -267,24 +330,78 @@ ensure_cnpg_plugin() {
   ok "kubectl-cnpg ${CNPG_TAG} instalado en $INSTALL_DIR/kubectl-cnpg"
 }
 
-# Descargar e instalar kpg
-install_kpg() {
-  if [ "$KPG_VERSION" = "latest" ]; then
-    KPG_URL="https://github.com/${REPO}/releases/latest/download/kpg-linux"
-    info "Descargando la última versión de kpg..."
+# Descargar e instalar o actualizar kpg
+ACTION_PERFORMED="installed"
+FINAL_VERSION=""
+
+install_or_update_kpg() {
+  resolve_target_kpg_version
+
+  if [ -n "$EXISTING_KPG" ]; then
+    if [ -n "$INSTALLED_VERSION" ] && [ -n "$TARGET_TAG" ] && [ "$INSTALLED_VERSION" = "$TARGET_TAG" ] && [ "$FORCE_INSTALL" != "1" ]; then
+      ok "kpg ya está actualizado en la versión ${INSTALLED_VERSION} (${EXISTING_KPG})."
+      info "Si deseas reinstalar de todas formas, ejecuta con KPG_FORCE=1."
+      ACTION_PERFORMED="up_to_date"
+      FINAL_VERSION="$INSTALLED_VERSION"
+      return 0
+    fi
+
+    ACTION_PERFORMED="updated"
+    FROM_LABEL="${INSTALLED_VERSION:-versión anterior}"
+    TO_LABEL="${TARGET_TAG:-latest}"
+    info "Actualizando kpg en ${INSTALL_DIR}: ${FROM_LABEL} → ${TO_LABEL}..."
   else
-    KPG_URL="https://github.com/${REPO}/releases/download/${KPG_VERSION}/kpg-linux"
-    info "Descargando kpg (${KPG_VERSION})..."
+    ACTION_PERFORMED="installed"
+    info "Descargando kpg (${TARGET_TAG:-latest})..."
+  fi
+
+  if [ -n "$TARGET_TAG" ]; then
+    KPG_URL="https://github.com/${REPO}/releases/download/${TARGET_TAG}/kpg-linux"
+  else
+    KPG_URL="https://github.com/${REPO}/releases/latest/download/kpg-linux"
   fi
 
   curl -fL --progress-bar -o "$TMP_DIR/kpg-linux" "$KPG_URL"
+  if [ ! -s "$TMP_DIR/kpg-linux" ]; then
+    err "El binario descargado de kpg está vacío."
+  fi
+
   install_binary "$TMP_DIR/kpg-linux" "kpg"
-  ok "kpg instalado en $INSTALL_DIR/kpg"
+
+  # Consultar versión final del binario recién instalado
+  if command -v timeout >/dev/null 2>&1; then
+    RAW_FINAL="$(timeout 2 "$INSTALL_DIR/kpg" --version </dev/null 2>/dev/null || true)"
+    FINAL_VERSION="$(printf '%s\n' "$RAW_FINAL" | sed -n 's/.*\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*[^[:space:]]*\).*/\1/p' | head -n 1 || true)"
+  fi
+  FINAL_VERSION="${FINAL_VERSION:-${TARGET_TAG:-latest}}"
+
+  # Guardar referencia de versión instalada (best-effort)
+  if mkdir -p "$STATE_DIR" 2>/dev/null; then
+    printf '%s\n' "$FINAL_VERSION" > "$VERSION_STATE_FILE" 2>/dev/null || true
+  fi
+
+  if [ "$ACTION_PERFORMED" = "updated" ]; then
+    ok "kpg actualizado a ${FINAL_VERSION} en $INSTALL_DIR/kpg"
+  else
+    ok "kpg ${FINAL_VERSION} instalado en $INSTALL_DIR/kpg"
+  fi
 }
 
 # Resumen final
 print_summary() {
-  printf "\n${C_BOLD}${C_GREEN}Instalación completada.${C_RESET}\n\n"
+  printf "\n"
+  case "$ACTION_PERFORMED" in
+    up_to_date)
+      printf "${C_BOLD}${C_GREEN}kpg ya se encuentra en la última versión (${FINAL_VERSION}).${C_RESET}\n\n"
+      ;;
+    updated)
+      printf "${C_BOLD}${C_GREEN}Actualización completada (${FINAL_VERSION}).${C_RESET}\n\n"
+      ;;
+    *)
+      printf "${C_BOLD}${C_GREEN}Instalación completada (${FINAL_VERSION}).${C_RESET}\n\n"
+      ;;
+  esac
+
   printf "  Binario kpg:      %s\n" "$INSTALL_DIR/kpg"
   if command -v kubectl >/dev/null 2>&1; then
     printf "  kubectl:          %s\n" "$(command -v kubectl)"
@@ -311,6 +428,7 @@ main() {
   check_platform
   setup_sudo
   detect_distro
+  detect_existing_kpg
 
   # Si no hay permisos de root ni sudo y el destino por defecto no es escribible, usar ~/.local/bin
   if [ "$(id -u)" -ne 0 ] && [ -z "$SUDO" ] && [ ! -w "$INSTALL_DIR" ]; then
@@ -329,7 +447,7 @@ main() {
     ensure_cnpg_plugin
   fi
 
-  install_kpg
+  install_or_update_kpg
   print_summary
 }
 

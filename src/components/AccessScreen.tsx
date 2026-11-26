@@ -72,9 +72,9 @@ const ACCESS_MENU_ITEMS: Array<{
   },
   {
     id: 'nodeport',
-    title: 'Acceso estable (NodePort) y contraseñas',
+    title: 'Acceso de red (NodePort / Solo local) y URLs',
     description:
-      'URL autogenerada con label ID, lista de usuarios/contraseñas, rotar clave (c) y destruir (x)',
+      'Selector NodePort / ClusterIP privado / Cerrado, guardar .env y copiar URLs al portapapeles',
   },
   {
     id: 'tls',
