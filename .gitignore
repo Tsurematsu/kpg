@@ -1,0 +1,38 @@
+# Documentación interna
+info.md
+
+# Dependencias de Node.js
+node_modules/
+
+# Compilación, bundles y ejecutables portables (SEA)
+dist/
+*.tsbuildinfo
+
+# Caché de descarga de binarios (node.exe para cross-build)
+.cache/
+
+# Respaldos locales de bases de datos
+backups/
+*.sql
+
+# Variables de entorno y credenciales generadas
+.env
+.env.*
+*.env
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Archivos del sistema operativo y editores
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

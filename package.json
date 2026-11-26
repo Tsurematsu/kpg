@@ -1,0 +1,33 @@
+{
+  "name": "kpg",
+  "version": "1.0.0",
+  "description": "TUI interactiva para gestionar bases de datos CloudNativePG en Kubernetes/k3s",
+  "main": "src/index.tsx",
+  "bin": {
+    "kpg": "src/index.tsx"
+  },
+  "scripts": {
+    "start": "tsx src/index.tsx",
+    "typecheck": "tsc --noEmit",
+    "build:bundle": "node scripts/build-sea.mjs --bundle-only",
+    "build:linux": "node scripts/build-sea.mjs --linux",
+    "build:win": "node scripts/build-sea.mjs --win",
+    "build:all": "node scripts/build-sea.mjs --linux --win"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "ink": "^8.0.0",
+    "js-yaml": "^5.5.0",
+    "react": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
