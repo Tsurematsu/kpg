@@ -55,7 +55,7 @@ Antes de ejecutar `kpg`, asegúrate de contar con:
 
 ### Descargar ejecutables precompilados (Recomendado)
 
-Puedes descargar los binarios portables (sin necesidad de instalar Node.js) directamente desde [GitHub Releases](https://github.com/Tsurematsu/kpg/releases/latest):
+Puedes descargar los binarios portables (sin necesidad de instalar Node.js) directamente desde [GitHub Releases](https://github.com/k3stool/kpg/releases/latest):
 
 * **Linux x64:** `kpg-linux` (dar permisos de ejecución con `chmod +x kpg-linux` y ejecutar `./kpg-linux`)
 * **Windows x64:** `kpg-win.exe`
@@ -64,7 +64,7 @@ Puedes descargar los binarios portables (sin necesidad de instalar Node.js) dire
 
 ```bash
 # Clonar el repositorio
-git clone https://github.com/Tsurematsu/kpg.git
+git clone https://github.com/k3stool/kpg.git
 cd kpg
 
 # Instalar dependencias

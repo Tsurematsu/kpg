@@ -3,7 +3,7 @@
 # Compatible con Ubuntu, Linux Mint, Arch Linux y Fedora (x86_64)
 #
 # Uso (instala o actualiza a la última versión):
-#   curl -fsSL https://tsurematsu.github.io/kpg/install.sh | sh
+#   curl -fsSL https://k3stool.github.io/kpg/install.sh | sh
 #
 # Variables opcionales:
 #   KPG_INSTALL_DIR=/usr/local/bin   Directorio de instalación (si ya existe kpg, reutiliza su carpeta)
@@ -13,7 +13,7 @@
 
 set -eu
 
-REPO="Tsurematsu/kpg"
+REPO="k3stool/kpg"
 USER_SET_INSTALL_DIR="${KPG_INSTALL_DIR:-}"
 INSTALL_DIR="${KPG_INSTALL_DIR:-/usr/local/bin}"
 KPG_VERSION="${KPG_VERSION:-latest}"
